@@ -69,7 +69,8 @@ XHYVE_SRC := \
 FIRMWARE_SRC := \
 	src/firmware/bootrom.c \
 	src/firmware/kexec.c \
-	src/firmware/fbsd.c
+	src/firmware/fbsd.c \
+	src/firmware/multiboot.c
 
 HAVE_OCAML_QCOW := $(shell if ocamlfind query qcow uri >/dev/null 2>/dev/null ; then echo YES ; else echo NO; fi)
 

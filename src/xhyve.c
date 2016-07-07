@@ -72,6 +72,7 @@
 #include <xhyve/firmware/kexec.h>
 #include <xhyve/firmware/fbsd.h>
 #include <xhyve/firmware/bootrom.h>
+#include <xhyve/firmware/multiboot.h>
 
 #ifdef HAVE_OCAML
 #include <caml/callback.h>
@@ -743,6 +744,8 @@ firmware_parse(const char *opt) {
 		fw_func = fbsd_load;
 	} else if (strncmp(fw, "bootrom", strlen("bootrom")) == 0) {
 		fw_func = bootrom_load;
+	} else if (strncmp(fw, "multiboot", strlen("multiboot")) == 0) {
+		fw_func = multiboot;
 	} else {
 		goto fail;
 	}
@@ -778,6 +781,8 @@ firmware_parse(const char *opt) {
 		fbsd_init(opt1, opt2, opt3, NULL);
 	} else if (fw_func == bootrom_load) {
 		bootrom_init(opt1);
+	} else if (fw_func == multiboot) {
+		multiboot_init(opt1, opt2, opt3);
 	} else {
 		goto fail;
 	}
@@ -788,7 +793,8 @@ fail:
 	fprintf(stderr, "Invalid firmware argument\n"
 		"    -f kexec,'kernel','initrd','\"cmdline\"'\n"
 		"    -f fbsd,'userboot','boot volume','\"kernel env\"'\n"
-		"    -f bootrom,'ROM',,\n"); /* FIXME: trailing commas _required_! */
+		"    -f bootrom,'ROM',,\n" /* FIXME: trailing commas _required_! */
+		"    -f multiboot,'kernel',module:module:...,cmdline\n");
 
 	return -1;
 }
