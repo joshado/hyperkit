@@ -28,6 +28,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
+
+#include <sys/stat.h>
+#include <sys/fcntl.h>
+#include <sys/mman.h>
 
 #include <xhyve/firmware/multiboot.h>
 #include <xhyve/vmm/vmm_api.h>
@@ -35,18 +41,29 @@
 #define MULTIBOOT_MAGIC 0x1BADB002
 #define MULTIBOOT_SEARCH_END 0x2000
 
-struct multiboot_header {
-	uint32_t magic;
-	uint32_t flags;
-	uint32_t checksum;
-};
-
 struct multiboot_load_header {
 	uint32_t header_addr;
 	uint32_t load_addr;
 	uint32_t load_end_addr;
 	uint32_t bss_end_addr;
 	uint32_t entry_addr;
+};
+
+struct multiboot_video_header {
+	uint32_t mode_type;
+	uint32_t width;
+	uint32_t height;
+	uint32_t depth;
+};
+
+struct multiboot_header {
+	struct {
+		uint32_t magic;
+		uint32_t flags;
+		uint32_t checksum;
+	} hdr;
+	struct multiboot_load_header lhdr;
+	struct multiboot_video_header vhdr;
 };
 
 struct multiboot_info  {
@@ -73,22 +90,22 @@ static struct multiboot_config {
 } config;
 
 struct boot_config {
-	long header_offset;
-	uint16_t load_alignment;
-	char provide_mem_headers;
-	char padding1[5];
+	void *mapping;
+	size_t file_size;
+
+	uintptr_t header;
 	uintptr_t guest_mem_base;
 	uintptr_t guest_mem_size;
+	uint32_t load_alignment;
+	uint32_t provide_mem_headers;
 
-	char padding2[4];
 	struct multiboot_load_header kernel_load_data;
+	uint32_t pad;
 };
 
-// #define ALIGN(p,n) (void*)((((uintptr_t)p/n) + 1)*n)
 
-int multiboot_find_header(FILE* image, struct boot_config* boot_config);
-size_t multiboot_load_image(FILE* image, struct boot_config *boot_config);
-uint64_t multiboot_set_guest_state(struct boot_config* boot_config);
+#define ROUND_UP(a, b) (((a) + (b) - 1) / (b) * (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 //
 // called by xhyve to pass in the firmware arguments
@@ -102,208 +119,157 @@ void multiboot_init(char *kernel_path, char *module_list, char *kernel_append)
 
 //
 // scans the configured kernel for it's multiboot header.
-// returns 0 if no multiboot header is found, non-zero if one is.
-int multiboot_find_header(FILE* image, struct boot_config* boot_config)
+// returns -1 if no multiboot header is found, 0 if one is.
+static int multiboot_find_header(struct boot_config* bc)
 {
-	struct multiboot_header header;
-	uint8_t found = 0;
+	struct multiboot_header *header = NULL;
+	uintptr_t ptr = (uintptr_t)bc->mapping;
+	uintptr_t sz = MIN(bc->file_size, MULTIBOOT_SEARCH_END);
+	uintptr_t end = ptr + sz - 48;
+	int found = 0;
 
-	fseek(image, 0L, SEEK_SET);
+	/* 48 - size of multiboot header */
+	for (; ptr < end; ptr += 4) {
+		header = (struct multiboot_header *)ptr;
 
-	while (!found || !feof(image) || ftell(image) < MULTIBOOT_SEARCH_END) {
-		boot_config->header_offset = ftell(image);
+		if (header->hdr.magic != MULTIBOOT_MAGIC)
+		       continue;
+		if (header->hdr.checksum + header->hdr.flags + header->hdr.magic != 0)
+			continue;
 
-		// fill our header struct with data from the file
-		if (1 != fread(&header, sizeof(struct multiboot_header), 1, image)) {
-			perror("error reading from kernel");
-			return 0;
-		}
-
-		if (header.magic == MULTIBOOT_MAGIC && header.checksum + header.flags + header.magic == 0) {
-			found = 1;
-			break;
-		}
-
-		// make sure to jump 64-bits back in the file, so that if there happens to be two
-		// magic values one after another, the second one doesn't get missed. The only
-		// requirement is the header is 32-bit aligned.
-		fseek(image, -8, SEEK_CUR);
+		found = 1;
+		break;
 	}
-
-	if (found == 0)
-		return 0;
-
-	printf("Parsing multiboot header:\n");
+	if (!found)
+		return -1;
+	bc->header = (uintptr_t)header;
 
 	// are there any mandatory flags that we don't support? (any other than 0 and 1 set)
-	uint16_t supported_mandatory = ((1<<1) | (1<<0));
-	if (((header.flags & ~supported_mandatory) & 0xFFFF) != 0x0) {
-		printf("Multiboot header has unsupported mandatory flags, bailing.\n");
-		return 0;
+	uint16_t supported_mandatory = ((1 << 1) | (1 << 0));
+	if (((header->hdr.flags & ~supported_mandatory) & 0xFFFF) != 0x0) {
+		fprintf(stderr, "multiboot: header has unsupported mandatory "
+				"flags (0x%x), bailing.\n", header->hdr.flags & 0xFFFF);
+		return -1;
 	}
 
 	// at this point, we need to check the flags and pull in the additional sections
-	if (header.flags & (1<<0)) {
-		printf(" (bit 0) Loading modules with 4K alignment\n");
-		boot_config->load_alignment = 4096;
-	} else {
-		boot_config->load_alignment = 1;
+	if (header->hdr.flags & (1 << 0))
+		bc->load_alignment = 4096;
+
+	if (header->hdr.flags & (1 << 1))
+		bc->provide_mem_headers = 1;
+
+	if (header->hdr.flags & (1<<16))
+		memcpy(&bc->kernel_load_data, &header->lhdr, sizeof(header->lhdr));
+	else {
+		fprintf(stderr, " (no bit 16) Image placement fields aren't valid - TODO: still try to load?\n");
+		return -1;
 	}
 
-	if (header.flags & (1<<1)) {
-		printf(" (bit 1) Must provide mem_* fields in multiboot header\n");
-		boot_config->provide_mem_headers = 1;
-	} else {
-		boot_config->provide_mem_headers = 0;
-	}
-
-	if (header.flags & (1<<16)) {
-		printf(" (bit 16) Multiboot image placement fields are valid\n");
-
-		// read the memory placement header directly into the boot config struct
-		if (1 != fread((void*)&boot_config->kernel_load_data, sizeof(struct multiboot_load_header), 1, image)) {
-			perror("failed to read image placement data from multiboot header");
-			return 0;
-		}
-	} else {
-		printf(" (no bit 16) Image placement fields aren't valid - TODO: still try to load?\n");
-		return 0;
-	}
-
-	return found;
+	return 0;
 }
 
-void* guest_to_host(void* guest_addr, struct boot_config *boot_config);
-void* host_to_guest(void* host_addr, struct boot_config *boot_config);
-void* guest_to_host(void* guest_addr, struct boot_config *boot_config)
+static uintptr_t guest_to_host(uintptr_t guest_addr, struct boot_config *bc)
 {
-	return (void*)(boot_config->guest_mem_base + (uintptr_t)guest_addr);
+	return bc->guest_mem_base + guest_addr;
 }
-void* host_to_guest(void* host_addr, struct boot_config *boot_config)
+static uintptr_t host_to_guest(uintptr_t host_addr, struct boot_config *bc)
 {
-	return (void*)((uintptr_t)host_addr - boot_config->guest_mem_base);
+	return host_addr - bc->guest_mem_base;
 }
 
-size_t multiboot_load_image(FILE* image, struct boot_config *boot_config)
+static int multiboot_load_image(struct boot_config *bc)
 {
 	size_t image_load_size;
-	unsigned long load_offset = (unsigned long)(boot_config->kernel_load_data.header_addr - boot_config->header_offset);
+	uintptr_t to = guest_to_host(bc->kernel_load_data.load_addr, bc);
+	uintptr_t from = bc->header - (bc->kernel_load_data.header_addr - bc->kernel_load_data.load_addr);
 
 	// if there wasn't a load_end_addr provided, then default it to the length of the image file
-	if (boot_config->kernel_load_data.load_end_addr == 0x0) {
-		fseek(image, 0x0, SEEK_END);
-		boot_config->kernel_load_data.load_end_addr = (uint32_t)ftell(image) + (uint32_t)load_offset;
-	}
-	image_load_size = boot_config->kernel_load_data.load_end_addr - boot_config->kernel_load_data.load_addr;
-	printf("image load size is %zu\n", image_load_size);
-	printf("header addr   = %x\n", boot_config->kernel_load_data.header_addr);
-	printf("load addr     = %x\n", boot_config->kernel_load_data.load_addr);
-	printf("load end addr = %x\n", boot_config->kernel_load_data.load_end_addr);
-	printf("bss end addr  = %x\n", boot_config->kernel_load_data.bss_end_addr);
-	printf("entry addr    = %x\n", boot_config->kernel_load_data.entry_addr);
+	if (bc->kernel_load_data.load_end_addr == 0x0)
+		bc->kernel_load_data.load_end_addr = bc->kernel_load_data.load_addr + (uint32_t)bc->file_size -
+			(uint32_t)(bc->header - (uintptr_t)bc->mapping);
+	image_load_size = bc->kernel_load_data.load_end_addr - bc->kernel_load_data.load_addr;
 
-	printf("Header offset is %lu, wants physical address %u\n", boot_config->header_offset, boot_config->kernel_load_data.header_addr);
+	memcpy((void *)to, (void *)from, image_load_size);
 
-	// Jump to the load offset
-	printf("Load addr is %i, offset is %lu seeking to %li in file\n", boot_config->kernel_load_data.load_addr,load_offset, boot_config->kernel_load_data.load_addr - (long)load_offset);
-	if (0 != fseek(image, boot_config->kernel_load_data.load_addr - (long)load_offset, SEEK_SET)) {
-		perror("fseek() to specified load_addr failed on the kernel image");
-		return 0;
-	}
-
-	if (1 != fread(guest_to_host((void *)(uintptr_t)boot_config->kernel_load_data.load_addr, boot_config), image_load_size, 1, image)) {
-		perror("fread() kernel image");
-		return 0;
-	}
-
-	void* magic_addr = guest_to_host((void*)(uintptr_t)boot_config->kernel_load_data.header_addr, boot_config);
-	printf("sanity-check: this should be the magic value: %x\n", *(uint32_t*)magic_addr);
-
-	return image_load_size;
+	return 0;
 }
 
-uint64_t multiboot_set_guest_state(struct boot_config* boot_config)
+static uint64_t multiboot_set_guest_state(struct boot_config* bc)
 {
-	struct multiboot_header* header = (struct multiboot_header*)boot_config->guest_mem_base;
-	void* guest_header_ptr = host_to_guest(header, boot_config);
-	header->flags = 0x1234;
+	struct multiboot_header* header = (struct multiboot_header *)bc->guest_mem_base;
+	uintptr_t guest_header_ptr = host_to_guest((uintptr_t)header, bc);
+	header->hdr.flags = 0x1234;
 
 	xh_vcpu_reset(0);
-	xh_vm_set_register(0, VM_REG_GUEST_CR0, 0x21);
 	xh_vm_set_register(0, VM_REG_GUEST_RAX, 0x2BADB002);
-	xh_vm_set_register(0, VM_REG_GUEST_RBX, (uint64_t)guest_header_ptr);
-	xh_vm_set_register(0, VM_REG_GUEST_RIP, boot_config->kernel_load_data.entry_addr);
+	xh_vm_set_register(0, VM_REG_GUEST_RBX, guest_header_ptr);
+	xh_vm_set_register(0, VM_REG_GUEST_RIP, bc->kernel_load_data.entry_addr);
 
-	// xh_vm_set_desc(0, VM_REG_GUEST_GDTR, (uintptr_t)gdt_entry - (uintptr_t)gpa_map, 0x1f, 0);
-	// xh_vm_set_desc(0, VM_REG_GUEST_CS, 0, 0xffffffff, 0xc09b);
-	// xh_vm_set_desc(0, VM_REG_GUEST_DS, 0, 0xffffffff, 0xc093);
-	// xh_vm_set_desc(0, VM_REG_GUEST_ES, 0, 0xffffffff, 0xc093);
-	// xh_vm_set_desc(0, VM_REG_GUEST_SS, 0, 0xffffffff, 0xc093);
-	xh_vm_set_register(0, VM_REG_GUEST_CS, 0x10);
-	xh_vm_set_register(0, VM_REG_GUEST_DS, 0x18);
-	xh_vm_set_register(0, VM_REG_GUEST_ES, 0x18);
-	xh_vm_set_register(0, VM_REG_GUEST_SS, 0x18);
+	xh_vm_set_desc(0, VM_REG_GUEST_CS, 0, 0xffffffff, 0xc09b);
+	xh_vm_set_desc(0, VM_REG_GUEST_DS, 0, 0xffffffff, 0xc093);
+	xh_vm_set_desc(0, VM_REG_GUEST_ES, 0, 0xffffffff, 0xc093);
+	xh_vm_set_desc(0, VM_REG_GUEST_FS, 0, 0xffffffff, 0xc093);
+	xh_vm_set_desc(0, VM_REG_GUEST_GS, 0, 0xffffffff, 0xc093);
+	xh_vm_set_desc(0, VM_REG_GUEST_SS, 0, 0xffffffff, 0xc093);
 
-	// xh_vm_set_register(0, VM_REG_GUEST_RBP, 0);
-	// xh_vm_set_register(0, VM_REG_GUEST_RDI, 0);
-	// xh_vm_set_register(0, VM_REG_GUEST_RFLAGS, 0x2);
-	// xh_vm_set_register(0, VM_REG_GUEST_RSI, 0x0);
+	xh_vm_set_register(0, VM_REG_GUEST_CR0, 0x21);
 
-	return boot_config->kernel_load_data.entry_addr;
+	return bc->kernel_load_data.entry_addr;
 }
 
 uint64_t multiboot(void)
 {
 	struct boot_config boot_config;
+	struct stat st;
+	uint64_t entry;
+	int fd;
 
-	FILE* kernel = fopen(config.kernel_path, "r");
-	if (kernel == NULL) {
-		perror("failed to open kernel");
-		exit(1);
+	memset(&boot_config, 0, sizeof(boot_config));
+	fd = open(config.kernel_path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "multiboot: failed to open kernel '%s': %s\n",
+				config.kernel_path, strerror(errno));
+		abort();
+	}
+	if (fstat(fd, &st) < 0) {
+		fprintf(stderr, "multiboot: failed to stat kernel '%s': %s\n",
+				config.kernel_path, strerror(errno));
+		close(fd);
+		abort();
+	}
+	boot_config.file_size = (size_t)st.st_size;
+
+	boot_config.mapping = mmap(NULL, (size_t)ROUND_UP(st.st_size, 4096),
+			PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (boot_config.mapping == (void *)MAP_FAILED) {
+		fprintf(stderr, "multiboot: failed to mmap kernel '%s': %s\n",
+				config.kernel_path, strerror(errno));
+		abort();
 	}
 
-	// peek at the first bit of the image, looking for a multiboot header,
-	// if found, load any image specific config that we understand into
-	// boot_config
-	if (0x0 == multiboot_find_header(kernel, &boot_config)) {
-		printf("Didn't find a multiboot header in '%s'\n", config.kernel_path);
-		exit(1);
+	if (multiboot_find_header(&boot_config)) {
+		fprintf(stderr, "multiboot: failed to find multiboot header in '%s'\n",
+				config.kernel_path);
+		abort();
 	}
 
 	// get the guest's memory range
-	void* gpa = xh_vm_map_gpa(0, xh_vm_get_lowmem_size());
+	void *gpa = xh_vm_map_gpa(0, xh_vm_get_lowmem_size());
 	boot_config.guest_mem_base = (uintptr_t)gpa;
 	boot_config.guest_mem_size = xh_vm_get_lowmem_size();
 
 	// actually load the image into the guest's memory
-	size_t image_length = multiboot_load_image(kernel, &boot_config);
-	if (0x0 == image_length) {
-		printf("Failed to load kernel image into memory\n");
-		exit(1);
+	if (multiboot_load_image(&boot_config)) {
+		fprintf(stderr, "multiboot: failed to load kernel image into "
+				"guest's memory\n");
+		abort();
 	}
 
-	// kernel image, we're done with you now.
-	if (kernel != NULL)
-		fclose(kernel);
-
-	// load in all the specified modules
-	char *s, *m;
-	int mods_count = 0;
-
-	s = m = config.module_list;
-
-	if (config.module_list) {
-		while (*m != 0x0) {
-			while (*m != 0x0 && *m != ':')
-				m++;
-			if (*m == ':')
-				m++;
-			printf("module\n");
-			mods_count++;
-		}
-	}
-
-	return multiboot_set_guest_state(&boot_config);
+	entry = multiboot_set_guest_state(&boot_config);
+	munmap(boot_config.mapping, ROUND_UP(boot_config.file_size, 4096));
+	return entry;
 }
 
 //   // write out the multiboot info struct
